@@ -1,31 +1,35 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License
- * 2.0 and the Server Side Public License, v 1; you may not use this file except
- * in compliance with, at your election, the Elastic License 2.0 or the Server
- * Side Public License, v 1.
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
 package org.elasticsearch.cluster.routing;
 
-import org.apache.logging.log4j.Logger;
 import org.apache.lucene.util.CollectionUtil;
-import org.elasticsearch.Assertions;
 import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.UnassignedInfo.AllocationStatus;
 import org.elasticsearch.cluster.routing.allocation.ExistingShardsAllocator;
+import org.elasticsearch.cluster.routing.allocation.RoutingAllocation;
+import org.elasticsearch.cluster.routing.allocation.allocator.DesiredBalanceMetrics;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.util.Maps;
+import org.elasticsearch.core.Assertions;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.logging.LogManager;
+import org.elasticsearch.logging.Logger;
 
-import java.util.AbstractCollection;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -41,8 +45,11 @@ import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+import static org.elasticsearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY;
 
 /**
  * {@link RoutingNodes} represents a copy the routing information contained in the {@link ClusterState cluster state}.
@@ -58,7 +65,14 @@ import java.util.stream.Collectors;
  * <li> {@link #failShard} fails/cancels an assigned shard.
  * </ul>
  */
-public class RoutingNodes extends AbstractCollection<RoutingNode> {
+public class RoutingNodes implements Iterable<RoutingNode> {
+
+    private static final Logger logger = LogManager.getLogger(RoutingNodes.class);
+    public static final String RESET_FAILED_ALLOCATION_COUNTER_LOG_MSG =
+        "Resetting failure counter for %d shard(s) that have reached their max allocation retires (%s)";
+    public static final String RESET_FAILED_RELOCATION_COUNTER_LOG_MSG =
+        "Resetting failure counter for %d shard(s) that have reached their max relocation retries (%s)";
+    private static final int MAX_SHARDS_IN_LOG_MSG = 20;
 
     private final Map<String, RoutingNode> nodesToShards;
 
@@ -77,6 +91,8 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
     private final Map<String, Set<String>> attributeValuesByAttribute;
     private final Map<String, Recoveries> recoveriesPerNode;
 
+    private Map<DiscoveryNode, DesiredBalanceMetrics.NodeWeightStats> balanceWeightStatsPerNode;
+
     /**
      * Creates an immutable instance from the {@link RoutingTable} and {@link DiscoveryNodes} found in a cluster state. Used to initialize
      * the routing nodes in {@link ClusterState#getRoutingNodes()}. This method should not be used directly, use
@@ -90,6 +106,14 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         return new RoutingNodes(routingTable, discoveryNodes, false);
     }
 
+    public void setBalanceWeightStatsPerNode(Map<DiscoveryNode, DesiredBalanceMetrics.NodeWeightStats> weightStatsPerNode) {
+        this.balanceWeightStatsPerNode = weightStatsPerNode;
+    }
+
+    public Map<DiscoveryNode, DesiredBalanceMetrics.NodeWeightStats> getBalanceWeightStatsPerNode() {
+        return balanceWeightStatsPerNode;
+    }
+
     private RoutingNodes(RoutingTable routingTable, DiscoveryNodes discoveryNodes, boolean readOnly) {
         this.readOnly = readOnly;
         this.recoveriesPerNode = new HashMap<>();
@@ -98,6 +122,7 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         this.unassignedShards = new UnassignedShards(this);
         this.attributeValuesByAttribute = Collections.synchronizedMap(new HashMap<>());
 
+        balanceWeightStatsPerNode = Maps.newMapWithExpectedSize(discoveryNodes.getDataNodes().size());
         nodesToShards = Maps.newMapWithExpectedSize(discoveryNodes.getDataNodes().size());
         // fill in the nodeToShards with the "live" nodes
         var dataNodes = discoveryNodes.getDataNodes().keySet();
@@ -249,9 +274,17 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         return primary;
     }
 
+    public Set<String> getAllNodeIds() {
+        return Collections.unmodifiableSet(nodesToShards.keySet());
+    }
+
     @Override
     public Iterator<RoutingNode> iterator() {
         return Collections.unmodifiableCollection(nodesToShards.values()).iterator();
+    }
+
+    public Stream<RoutingNode> stream() {
+        return nodesToShards.values().stream();
     }
 
     public Iterator<RoutingNode> mutableIterator() {
@@ -345,14 +378,12 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
     }
 
     /**
-     * Returns one active replica shard for the given shard id or <code>null</code> if
-     * no active replica is found.
+     * Returns one active and promotable replica shard for the given shard id or <code>null</code> if no active replica is found.
      *
-     * Since replicas could possibly be on nodes with a older version of ES than
-     * the primary is, this will return replicas on the highest version of ES.
-     *
+     * Since replicas could possibly be on nodes with a older version of ES than the primary is, this will return replicas on the highest
+     * version of ES.
      */
-    public ShardRouting activeReplicaWithHighestVersion(ShardId shardId) {
+    public ShardRouting activePromotableReplicaWithHighestVersion(ShardId shardId) {
         // It's possible for replicaNodeVersion to be null, when disassociating dead nodes
         // that have been removed, the shards are failed, and part of the shard failing
         // calls this method with an out-of-date RoutingNodes, where the version might not
@@ -361,6 +392,7 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         return assignedShards(shardId).stream()
             .filter(shr -> shr.primary() == false && shr.active())
             .filter(shr -> node(shr.currentNodeId()) != null)
+            .filter(ShardRouting::isPromotableToPrimary)
             .max(
                 Comparator.comparing(
                     shr -> node(shr.currentNodeId()).node(),
@@ -373,29 +405,20 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
     /**
      * Returns <code>true</code> iff all replicas are active for the given shard routing. Otherwise <code>false</code>
      */
-    public boolean allReplicasActive(ShardId shardId, Metadata metadata) {
+    public boolean allShardsActive(ShardId shardId, Metadata metadata) {
         final List<ShardRouting> shards = assignedShards(shardId);
-        if (shards.isEmpty() || shards.size() < metadata.getIndexSafe(shardId.getIndex()).getNumberOfReplicas() + 1) {
+        final int shardCopies = metadata.getIndexSafe(shardId.getIndex()).getNumberOfReplicas() + 1;
+        if (shards.size() < shardCopies) {
             return false; // if we are empty nothing is active if we have less than total at least one is unassigned
         }
+        int active = 0;
         for (ShardRouting shard : shards) {
-            if (shard.active() == false) {
-                return false;
+            if (shard.active()) {
+                active++;
             }
         }
-        return true;
-    }
-
-    public List<ShardRouting> shards(Predicate<ShardRouting> predicate) {
-        List<ShardRouting> shards = new ArrayList<>();
-        for (RoutingNode routingNode : this) {
-            for (ShardRouting shardRouting : routingNode) {
-                if (predicate.test(shardRouting)) {
-                    shards.add(shardRouting);
-                }
-            }
-        }
-        return shards;
+        assert active <= shardCopies;
+        return active == shardCopies;
     }
 
     @Override
@@ -448,6 +471,7 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         ShardRouting startedShard,
         String nodeId,
         long expectedShardSize,
+        String reason,
         RoutingChangesObserver changes
     ) {
         ensureMutable();
@@ -458,7 +482,7 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         node(target.currentNodeId()).add(target);
         assignedShardsAdd(target);
         addRecovery(target);
-        changes.relocationStarted(startedShard, target);
+        changes.relocationStarted(startedShard, target, reason);
         return Tuple.tuple(source, target);
     }
 
@@ -473,14 +497,12 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
      * @return the started shard
      */
     public ShardRouting startShard(
-        Logger logger,
         ShardRouting initializingShard,
         RoutingChangesObserver routingChangesObserver,
         long startedExpectedShardSize
     ) {
         ensureMutable();
         ShardRouting startedShard = started(initializingShard, startedExpectedShardSize);
-        logger.trace("{} marked shard as started (routing: {})", initializingShard.shardId(), initializingShard);
         routingChangesObserver.shardStarted(initializingShard, startedShard);
 
         if (initializingShard.relocatingNodeId() != null) {
@@ -516,6 +538,7 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
                                 startedReplica,
                                 sourceShard.relocatingNodeId(),
                                 sourceShard.getExpectedShardSize(),
+                                "restarting relocation",
                                 routingChangesObserver
                             );
                         } else {
@@ -543,23 +566,14 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
      * - If shard is a (primary or replica) relocation target, this also clears the relocation information on the source shard.
      *
      */
-    public void failShard(
-        Logger logger,
-        ShardRouting failedShard,
-        UnassignedInfo unassignedInfo,
-        IndexMetadata indexMetadata,
-        RoutingChangesObserver routingChangesObserver
-    ) {
+    public void failShard(ShardRouting failedShard, UnassignedInfo unassignedInfo, RoutingChangesObserver routingChangesObserver) {
         ensureMutable();
         assert failedShard.assignedToNode() : "only assigned shards can be failed";
-        assert indexMetadata.getIndex().equals(failedShard.index()) : "shard failed for unknown index (shard entry: " + failedShard + ")";
         assert getByAllocationId(failedShard.shardId(), failedShard.allocationId().getId()) == failedShard
             : "shard routing to fail does not exist in routing table, expected: "
                 + failedShard
                 + " but was: "
                 + getByAllocationId(failedShard.shardId(), failedShard.allocationId().getId());
-
-        logger.debug("{} failing shard {} with unassigned info ({})", failedShard.shardId(), failedShard, unassignedInfo.shortSummary());
 
         // if this is a primary, fail initializing replicas first (otherwise we move RoutingNodes into an inconsistent state)
         if (failedShard.primary()) {
@@ -576,14 +590,14 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
                             "primary failed while replica initializing",
                             null,
                             0,
-                            unassignedInfo.getUnassignedTimeInNanos(),
-                            unassignedInfo.getUnassignedTimeInMillis(),
+                            unassignedInfo.unassignedTimeNanos(),
+                            unassignedInfo.unassignedTimeMillis(),
                             false,
                             AllocationStatus.NO_ATTEMPT,
                             Collections.emptySet(),
                             routing.currentNodeId()
                         );
-                        failShard(logger, replicaShard, primaryFailedUnassignedInfo, indexMetadata, routingChangesObserver);
+                        failShard(replicaShard, primaryFailedUnassignedInfo, routingChangesObserver);
                     }
                 }
             }
@@ -594,12 +608,10 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
             ShardRouting targetShard = getByAllocationId(failedShard.shardId(), failedShard.allocationId().getRelocationId());
             assert targetShard.isRelocationTargetOf(failedShard);
             if (failedShard.primary()) {
-                logger.trace("{} is removed due to the failure/cancellation of the source shard", targetShard);
                 // cancel and remove target shard
                 remove(targetShard);
                 routingChangesObserver.shardFailed(targetShard, unassignedInfo);
             } else {
-                logger.trace("{}, relocation source failed / cancelled, mark as initializing without relocation source", targetShard);
                 // promote to initializing shard without relocation source and ensure that removed relocation source
                 // is not added back as unassigned shard
                 removeRelocationSource(targetShard);
@@ -620,19 +632,8 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
             } else {
                 // The shard is a target of a relocating shard. In that case we only need to remove the target shard and cancel the source
                 // relocation. No shard is left unassigned
-                logger.trace(
-                    "{} is a relocation target, resolving source to cancel relocation ({})",
-                    failedShard,
-                    unassignedInfo.shortSummary()
-                );
                 ShardRouting sourceShard = getByAllocationId(failedShard.shardId(), failedShard.allocationId().getRelocationId());
                 assert sourceShard.isRelocationSourceOf(failedShard);
-                logger.trace(
-                    "{}, resolved source to [{}]. canceling relocation ... ({})",
-                    failedShard.shardId(),
-                    sourceShard,
-                    unassignedInfo.shortSummary()
-                );
                 cancelRelocation(sourceShard);
                 remove(failedShard);
             }
@@ -655,17 +656,36 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
     }
 
     private void unassignPrimaryAndPromoteActiveReplicaIfExists(
-        ShardRouting failedShard,
+        ShardRouting failedPrimary,
         UnassignedInfo unassignedInfo,
         RoutingChangesObserver routingChangesObserver
     ) {
-        assert failedShard.primary();
-        ShardRouting activeReplica = activeReplicaWithHighestVersion(failedShard.shardId());
-        if (activeReplica == null) {
-            moveToUnassigned(failedShard, unassignedInfo);
+        assert failedPrimary.primary();
+        ShardRouting replicaToPromote = activePromotableReplicaWithHighestVersion(failedPrimary.shardId());
+        if (replicaToPromote == null) {
+            moveToUnassigned(failedPrimary, unassignedInfo);
+            for (ShardRouting unpromotableReplica : List.copyOf(assignedShards(failedPrimary.shardId()))) {
+                assert unpromotableReplica.primary() == false : unpromotableReplica;
+                assert unpromotableReplica.isPromotableToPrimary() == false : unpromotableReplica;
+                moveToUnassigned(
+                    unpromotableReplica,
+                    new UnassignedInfo(
+                        UnassignedInfo.Reason.UNPROMOTABLE_REPLICA,
+                        unassignedInfo.message(),
+                        unassignedInfo.failure(),
+                        0,
+                        unassignedInfo.unassignedTimeNanos(),
+                        unassignedInfo.unassignedTimeMillis(),
+                        false, // TODO debatable, but do we want to delay reassignment of unpromotable replicas tho?
+                        AllocationStatus.NO_ATTEMPT,
+                        Set.of(),
+                        unpromotableReplica.currentNodeId()
+                    )
+                );
+            }
         } else {
-            movePrimaryToUnassignedAndDemoteToReplica(failedShard, unassignedInfo);
-            promoteReplicaToPrimary(activeReplica, routingChangesObserver);
+            movePrimaryToUnassignedAndDemoteToReplica(failedPrimary, unassignedInfo);
+            promoteReplicaToPrimary(replicaToPromote, routingChangesObserver);
         }
     }
 
@@ -835,7 +855,6 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
     /**
      * Returns the number of routing nodes
      */
-    @Override
     public int size() {
         return nodesToShards.size();
     }
@@ -951,6 +970,10 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
             return new UnassignedIterator();
         }
 
+        public Stream<ShardRouting> stream() {
+            return StreamSupport.stream(spliterator(), false);
+        }
+
         /**
          * The list of ignored unassigned shards (read only). The ignored unassigned shards
          * are not part of the formal unassigned list, but are kept around and used to build
@@ -974,18 +997,18 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
                 ignoredPrimaries++;
                 UnassignedInfo currInfo = shard.unassignedInfo();
                 assert currInfo != null;
-                if (allocationStatus.equals(currInfo.getLastAllocationStatus()) == false) {
+                if (allocationStatus.equals(currInfo.lastAllocationStatus()) == false) {
                     UnassignedInfo newInfo = new UnassignedInfo(
-                        currInfo.getReason(),
-                        currInfo.getMessage(),
-                        currInfo.getFailure(),
-                        currInfo.getNumFailedAllocations(),
-                        currInfo.getUnassignedTimeInNanos(),
-                        currInfo.getUnassignedTimeInMillis(),
-                        currInfo.isDelayed(),
+                        currInfo.reason(),
+                        currInfo.message(),
+                        currInfo.failure(),
+                        currInfo.failedAllocations(),
+                        currInfo.unassignedTimeNanos(),
+                        currInfo.unassignedTimeMillis(),
+                        currInfo.delayed(),
                         allocationStatus,
-                        currInfo.getFailedNodeIds(),
-                        currInfo.getLastAllocatedNodeId()
+                        currInfo.failedNodeIds(),
+                        currInfo.lastAllocatedNodeId()
                     );
                     ShardRouting updatedShard = shard.updateUnassigned(newInfo, shard.recoverySource());
                     changes.unassignedInfoUpdated(shard, newInfo);
@@ -1280,26 +1303,68 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
         }
     }
 
-    public void resetFailedCounter(RoutingChangesObserver routingChangesObserver) {
+    public boolean hasAllocationFailures() {
+        return unassignedShards.stream().anyMatch((shardRouting -> {
+            if (shardRouting.unassignedInfo() == null) {
+                return false;
+            }
+            return shardRouting.unassignedInfo().failedAllocations() > 0;
+        }));
+    }
+
+    public boolean hasRelocationFailures() {
+        for (var shardRoutings : assignedShards.values()) {
+            for (var routing : shardRoutings) {
+                if (routing.relocationFailureInfo() != null && routing.relocationFailureInfo().failedRelocations() > 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public void resetFailedCounter(RoutingAllocation allocation) {
+        final var observer = allocation.changes();
+        int shardsWithMaxFailedAllocations = 0;
+        int shardsWithMaxFailedRelocations = 0;
+        List<ShardId> topShardIdsWithFailedAllocations = new ArrayList<>();
+        List<ShardId> topShardIdsWithFailedRelocations = new ArrayList<>();
+
         final var unassignedIterator = unassigned().iterator();
         while (unassignedIterator.hasNext()) {
             ShardRouting shardRouting = unassignedIterator.next();
             UnassignedInfo unassignedInfo = shardRouting.unassignedInfo();
+            int failedAllocations = unassignedInfo.failedAllocations();
+            if (failedAllocations > 0) {
+                try {
+                    final var maxRetry = SETTING_ALLOCATION_MAX_RETRY.get(
+                        allocation.metadata().getIndexSafe(shardRouting.index()).getSettings()
+                    );
+                    if (failedAllocations >= maxRetry) {
+                        shardsWithMaxFailedAllocations++;
+                        if (topShardIdsWithFailedAllocations.size() <= MAX_SHARDS_IN_LOG_MSG) {
+                            topShardIdsWithFailedAllocations.add(shardRouting.shardId());
+                        }
+                    }
+                } catch (IndexNotFoundException e) {
+                    // ignore
+                }
+            }
             unassignedIterator.updateUnassigned(
                 new UnassignedInfo(
-                    unassignedInfo.getNumFailedAllocations() > 0 ? UnassignedInfo.Reason.MANUAL_ALLOCATION : unassignedInfo.getReason(),
-                    unassignedInfo.getMessage(),
-                    unassignedInfo.getFailure(),
+                    failedAllocations > 0 ? UnassignedInfo.Reason.MANUAL_ALLOCATION : unassignedInfo.reason(),
+                    unassignedInfo.message(),
+                    unassignedInfo.failure(),
                     0,
-                    unassignedInfo.getUnassignedTimeInNanos(),
-                    unassignedInfo.getUnassignedTimeInMillis(),
-                    unassignedInfo.isDelayed(),
-                    unassignedInfo.getLastAllocationStatus(),
+                    unassignedInfo.unassignedTimeNanos(),
+                    unassignedInfo.unassignedTimeMillis(),
+                    unassignedInfo.delayed(),
+                    unassignedInfo.lastAllocationStatus(),
                     Collections.emptySet(),
-                    unassignedInfo.getLastAllocatedNodeId()
+                    unassignedInfo.lastAllocatedNodeId()
                 ),
                 shardRouting.recoverySource(),
-                routingChangesObserver
+                observer
             );
         }
 
@@ -1308,6 +1373,20 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
             for (ShardRouting shardRouting : routingNode) {
                 if (shardRouting.relocationFailureInfo() != null && shardRouting.relocationFailureInfo().failedRelocations() > 0) {
                     shardsWithRelocationFailures.add(shardRouting);
+                    try {
+                        int failedRelocations = shardRouting.relocationFailureInfo().failedRelocations();
+                        final var maxRetry = SETTING_ALLOCATION_MAX_RETRY.get(
+                            allocation.metadata().getIndexSafe(shardRouting.index()).getSettings()
+                        );
+                        if (failedRelocations >= maxRetry) {
+                            shardsWithMaxFailedRelocations++;
+                            if (topShardIdsWithFailedRelocations.size() <= MAX_SHARDS_IN_LOG_MSG) {
+                                topShardIdsWithFailedRelocations.add(shardRouting.shardId());
+                            }
+                        }
+                    } catch (IndexNotFoundException e) {
+                        // ignore
+                    }
                 }
             }
 
@@ -1317,6 +1396,17 @@ public class RoutingNodes extends AbstractCollection<RoutingNode> {
                 assignedShardsRemove(original);
                 assignedShardsAdd(updated);
             }
+        }
+
+        if (shardsWithMaxFailedAllocations > 0) {
+            logger.info(
+                Strings.format(RESET_FAILED_ALLOCATION_COUNTER_LOG_MSG, shardsWithMaxFailedAllocations, topShardIdsWithFailedAllocations)
+            );
+        }
+        if (shardsWithMaxFailedRelocations > 0) {
+            logger.info(
+                Strings.format(RESET_FAILED_RELOCATION_COUNTER_LOG_MSG, shardsWithMaxFailedRelocations, topShardIdsWithFailedRelocations)
+            );
         }
     }
 

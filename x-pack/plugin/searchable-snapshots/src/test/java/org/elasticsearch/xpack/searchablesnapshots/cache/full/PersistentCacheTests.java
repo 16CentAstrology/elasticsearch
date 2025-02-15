@@ -13,6 +13,7 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.tests.mockfile.FilterFileChannel;
 import org.apache.lucene.tests.mockfile.FilterFileSystemProvider;
 import org.apache.lucene.tests.mockfile.FilterPath;
+import org.elasticsearch.blobcache.common.ByteRange;
 import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.set.Sets;
@@ -24,7 +25,6 @@ import org.elasticsearch.env.Environment;
 import org.elasticsearch.env.NodeEnvironment;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.xpack.searchablesnapshots.AbstractSearchableSnapshotsTestCase;
-import org.elasticsearch.xpack.searchablesnapshots.cache.common.ByteRange;
 import org.elasticsearch.xpack.searchablesnapshots.cache.common.CacheFile;
 import org.elasticsearch.xpack.searchablesnapshots.cache.common.CacheKey;
 
@@ -388,16 +388,12 @@ public class PersistentCacheTests extends AbstractSearchableSnapshotsTestCase {
                         super.force(metaData);
                         return;
                     }
-                    try {
-                        blockingLatch.countDown();
-                        releasingLatch.await();
-                        if (failFSync.get()) {
-                            throw new IOException("Simulated");
-                        } else {
-                            super.force(metaData);
-                        }
-                    } catch (InterruptedException e) {
-                        throw new AssertionError(e);
+                    blockingLatch.countDown();
+                    safeAwait(releasingLatch);
+                    if (failFSync.get()) {
+                        throw new IOException("Simulated");
+                    } else {
+                        super.force(metaData);
                     }
                 }
             };
@@ -409,11 +405,7 @@ public class PersistentCacheTests extends AbstractSearchableSnapshotsTestCase {
         }
 
         public void waitForBlock() {
-            try {
-                blockingLatch.await();
-            } catch (InterruptedException e) {
-                throw new AssertionError(e);
-            }
+            safeAwait(blockingLatch);
         }
 
         public void unblock() {

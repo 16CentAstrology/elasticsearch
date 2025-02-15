@@ -2,6 +2,12 @@
 [[ml-df-trained-models-apis]]
 = {ml-cap} trained model APIs
 
+.New API reference
+[sidebar]
+--
+For the most up-to-date API details, refer to {api-es}/group/endpoint-ml-trained-model[{ml-cap} trained model APIs].
+--
+
 You can use the following APIs to perform model management operations:
 
 * <<clear-trained-model-deployment-cache>>
@@ -23,7 +29,3 @@ an aggregation. Refer to the following documentation to learn more:
 
 * <<search-aggregations-pipeline-inference-bucket-aggregation,{infer-cap} bucket aggregation>>
 * <<inference-processor,{infer-cap} processor>>
-
-You can use your trained model to perform semantic search:
-
-* <<semantic-search-api>>

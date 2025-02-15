@@ -1,43 +1,42 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License
- * 2.0 and the Server Side Public License, v 1; you may not use this file except
- * in compliance with, at your election, the Elastic License 2.0 or the Server
- * Side Public License, v 1.
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
 package org.elasticsearch.script.field.vectors;
 
-import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.core.SuppressForbidden;
 
 import java.util.List;
 
 public class ByteKnnDenseVector implements DenseVector {
 
-    protected final BytesRef docVector;
+    protected final byte[] docVector;
 
     protected float[] floatDocVector;
     protected boolean magnitudeCalculated = false;
     protected float magnitude;
 
-    public ByteKnnDenseVector(BytesRef vector) {
+    public ByteKnnDenseVector(byte[] vector) {
         this.docVector = vector;
     }
 
     @Override
     public float[] getVector() {
+        // TODO it would be really nice if we didn't transform the `byte[]` arrays to `float[]`
         if (floatDocVector == null) {
             floatDocVector = new float[docVector.length];
-
             int i = 0;
-            int j = docVector.offset;
-
             while (i < docVector.length) {
-                floatDocVector[i++] = docVector.bytes[j++];
+                floatDocVector[i] = docVector[i];
+                i++;
             }
         }
-
         return floatDocVector;
     }
 
@@ -52,13 +51,7 @@ public class ByteKnnDenseVector implements DenseVector {
 
     @Override
     public int dotProduct(byte[] queryVector) {
-        int result = 0;
-        int i = 0;
-        int j = docVector.offset;
-        while (i < docVector.length) {
-            result += docVector.bytes[j++] * queryVector[i++];
-        }
-        return result;
+        return VectorUtil.dotProduct(docVector, queryVector);
     }
 
     @Override
@@ -70,15 +63,15 @@ public class ByteKnnDenseVector implements DenseVector {
     public double dotProduct(List<Number> queryVector) {
         int result = 0;
         int i = 0;
-        int j = docVector.offset;
         while (i < docVector.length) {
-            result += docVector.bytes[j++] * queryVector.get(i++).intValue();
+            result += docVector[i] * queryVector.get(i).intValue();
+            i++;
         }
         return result;
     }
 
     @SuppressForbidden(reason = "used only for bytes so it cannot overflow")
-    private int abs(int value) {
+    private static int abs(int value) {
         return Math.abs(value);
     }
 
@@ -86,9 +79,9 @@ public class ByteKnnDenseVector implements DenseVector {
     public int l1Norm(byte[] queryVector) {
         int result = 0;
         int i = 0;
-        int j = docVector.offset;
         while (i < docVector.length) {
-            result += abs(docVector.bytes[j++] - queryVector[i++]);
+            result += abs(docVector[i] - queryVector[i]);
+            i++;
         }
         return result;
     }
@@ -102,23 +95,30 @@ public class ByteKnnDenseVector implements DenseVector {
     public double l1Norm(List<Number> queryVector) {
         int result = 0;
         int i = 0;
-        int j = docVector.offset;
         while (i < docVector.length) {
-            result += abs(docVector.bytes[j++] - queryVector.get(i++).intValue());
+            result += abs(docVector[i] - queryVector.get(i).intValue());
+            i++;
         }
         return result;
     }
 
     @Override
-    public double l2Norm(byte[] queryVector) {
-        int result = 0;
-        int i = 0;
-        int j = docVector.offset;
-        while (i < docVector.length) {
-            int diff = docVector.bytes[j++] - queryVector[i++];
-            result += diff * diff;
+    public int hamming(byte[] queryVector) {
+        return VectorUtil.xorBitCount(queryVector, docVector);
+    }
+
+    @Override
+    public int hamming(List<Number> queryVector) {
+        int distance = 0;
+        for (int i = 0; i < queryVector.size(); i++) {
+            distance += Integer.bitCount((queryVector.get(i).intValue() ^ docVector[i]) & 0xFF);
         }
-        return Math.sqrt(result);
+        return distance;
+    }
+
+    @Override
+    public double l2Norm(byte[] queryVector) {
+        return Math.sqrt(VectorUtil.squareDistance(docVector, queryVector));
     }
 
     @Override
@@ -130,10 +130,10 @@ public class ByteKnnDenseVector implements DenseVector {
     public double l2Norm(List<Number> queryVector) {
         int result = 0;
         int i = 0;
-        int j = docVector.offset;
         while (i < docVector.length) {
-            int diff = docVector.bytes[j++] - queryVector.get(i++).intValue();
+            int diff = docVector[i] - queryVector.get(i).intValue();
             result += diff * diff;
+            i++;
         }
         return Math.sqrt(result);
     }

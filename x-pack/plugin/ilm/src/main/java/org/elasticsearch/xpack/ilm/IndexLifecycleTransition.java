@@ -30,6 +30,7 @@ import org.elasticsearch.xpack.core.ilm.LifecyclePolicy;
 import org.elasticsearch.xpack.core.ilm.LifecyclePolicyMetadata;
 import org.elasticsearch.xpack.core.ilm.LifecycleSettings;
 import org.elasticsearch.xpack.core.ilm.Phase;
+import org.elasticsearch.xpack.core.ilm.PhaseCompleteStep;
 import org.elasticsearch.xpack.core.ilm.PhaseExecutionInfo;
 import org.elasticsearch.xpack.core.ilm.RolloverAction;
 import org.elasticsearch.xpack.core.ilm.Step;
@@ -84,14 +85,17 @@ public final class IndexLifecycleTransition {
         }
 
         final Set<Step.StepKey> cachedStepKeys = stepRegistry.parseStepKeysFromPhase(
-            lifecycleState.phaseDefinition(),
-            lifecycleState.phase()
+            policyName,
+            lifecycleState.phase(),
+            lifecycleState.phaseDefinition()
         );
         boolean isNewStepCached = cachedStepKeys != null && cachedStepKeys.contains(newStepKey);
 
         // Always allow moving to the terminal step or to a step that's present in the cached phase, even if it doesn't exist in the policy
         if (isNewStepCached == false
-            && (stepRegistry.stepExists(policyName, newStepKey) == false && newStepKey.equals(TerminalPolicyStep.KEY) == false)) {
+            && (stepRegistry.stepExists(policyName, newStepKey) == false
+                && newStepKey.equals(TerminalPolicyStep.KEY) == false
+                && newStepKey.equals(PhaseCompleteStep.stepKey(lifecycleState.phase())) == false)) {
             throw new IllegalArgumentException(
                 "step [" + newStepKey + "] for index [" + indexName + "] with policy [" + policyName + "] does not exist"
             );
@@ -133,7 +137,8 @@ public final class IndexLifecycleTransition {
             lifecycleState,
             newStepKey,
             nowSupplier,
-            forcePhaseDefinitionRefresh
+            forcePhaseDefinitionRefresh,
+            true
         );
 
         return LifecycleExecutionStateUtils.newClusterStateWithLifecycleState(state, idxMeta.getIndex(), newLifecycleState);
@@ -171,6 +176,7 @@ public final class IndexLifecycleTransition {
             currentState,
             new Step.StepKey(currentStep.phase(), currentStep.action(), ErrorStep.NAME),
             nowSupplier,
+            false,
             false
         );
 
@@ -239,7 +245,8 @@ public final class IndexLifecycleTransition {
                 lifecycleState,
                 nextStepKey,
                 nowSupplier,
-                forcePhaseDefinitionRefresh
+                forcePhaseDefinitionRefresh,
+                false
             );
 
             LifecycleExecutionState.Builder retryStepState = LifecycleExecutionState.builder(nextStepState);
@@ -273,7 +280,8 @@ public final class IndexLifecycleTransition {
         LifecycleExecutionState existingState,
         Step.StepKey newStep,
         LongSupplier nowSupplier,
-        boolean forcePhaseDefinitionRefresh
+        boolean forcePhaseDefinitionRefresh,
+        boolean allowNullPreviousStepInfo
     ) {
         Step.StepKey currentStep = Step.getCurrentStepKey(existingState);
         long nowAsMillis = nowSupplier.getAsLong();
@@ -285,6 +293,9 @@ public final class IndexLifecycleTransition {
 
         // clear any step info or error-related settings from the current step
         updatedState.setFailedStep(null);
+        if (allowNullPreviousStepInfo || existingState.stepInfo() != null) {
+            updatedState.setPreviousStepInfo(existingState.stepInfo());
+        }
         updatedState.setStepInfo(null);
         updatedState.setIsAutoRetryableError(null);
         updatedState.setFailedStepRetryCount(null);
@@ -385,6 +396,7 @@ public final class IndexLifecycleTransition {
         updatedState.setStep(nextStep.name());
         updatedState.setStepTime(nowAsMillis);
         updatedState.setFailedStep(null);
+        updatedState.setPreviousStepInfo(null);
         updatedState.setStepInfo(null);
         updatedState.setIsAutoRetryableError(null);
         updatedState.setFailedStepRetryCount(null);

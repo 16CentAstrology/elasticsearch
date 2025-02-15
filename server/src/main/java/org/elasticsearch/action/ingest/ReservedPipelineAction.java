@@ -1,22 +1,21 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License
- * 2.0 and the Server Side Public License, v 1; you may not use this file except
- * in compliance with, at your election, the Elastic License 2.0 or the Server
- * Side Public License, v 1.
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
 package org.elasticsearch.action.ingest;
 
 import org.elasticsearch.ElasticsearchGenerationException;
-import org.elasticsearch.action.admin.cluster.node.info.NodesInfoResponse;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.ingest.IngestMetadata;
 import org.elasticsearch.ingest.IngestService;
 import org.elasticsearch.reservedstate.ReservedClusterStateHandler;
 import org.elasticsearch.reservedstate.TransformState;
-import org.elasticsearch.reservedstate.service.FileSettingsService;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentParser;
@@ -40,19 +39,11 @@ import java.util.stream.Collectors;
 public class ReservedPipelineAction implements ReservedClusterStateHandler<List<PutPipelineRequest>> {
     public static final String NAME = "ingest_pipelines";
 
-    private final IngestService ingestService;
-    private final FileSettingsService fileSettingsService;
-
     /**
      * Creates a ReservedPipelineAction
      *
-     * @param ingestService requires {@link IngestService} for storing/deleting the pipelines
-     * @param fileSettingsService required for supplying the latest node infos
      */
-    public ReservedPipelineAction(IngestService ingestService, FileSettingsService fileSettingsService) {
-        this.ingestService = ingestService;
-        this.fileSettingsService = fileSettingsService;
-    }
+    public ReservedPipelineAction() {}
 
     @Override
     public String name() {
@@ -61,11 +52,9 @@ public class ReservedPipelineAction implements ReservedClusterStateHandler<List<
 
     private Collection<PutPipelineRequest> prepare(List<PutPipelineRequest> requests) {
         var exceptions = new ArrayList<Exception>();
-        NodesInfoResponse nodeInfos = fileSettingsService.nodeInfos();
-        assert nodeInfos != null;
         for (var pipeline : requests) {
             try {
-                ingestService.validatePipelineRequest(pipeline, nodeInfos);
+                validate(pipeline);
             } catch (Exception e) {
                 exceptions.add(e);
             }
@@ -80,7 +69,7 @@ public class ReservedPipelineAction implements ReservedClusterStateHandler<List<
         return requests;
     }
 
-    private ClusterState wrapIngestTaskExecute(IngestService.PipelineClusterStateUpdateTask task, ClusterState state) {
+    private static ClusterState wrapIngestTaskExecute(IngestService.PipelineClusterStateUpdateTask task, ClusterState state) {
         final var allIndexMetadata = state.metadata().indices().values();
         final IngestMetadata currentIndexMetadata = state.metadata().custom(IngestMetadata.TYPE);
 
@@ -112,7 +101,14 @@ public class ReservedPipelineAction implements ReservedClusterStateHandler<List<
         toDelete.removeAll(entities);
 
         for (var pipelineToDelete : toDelete) {
-            var task = new IngestService.DeletePipelineClusterStateUpdateTask(pipelineToDelete);
+            var task = new IngestService.DeletePipelineClusterStateUpdateTask(
+                null,
+                new DeletePipelineRequest(
+                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+                    RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+                    pipelineToDelete
+                )
+            );
             state = wrapIngestTaskExecute(task, state);
         }
 
@@ -130,7 +126,15 @@ public class ReservedPipelineAction implements ReservedClusterStateHandler<List<
             Map<String, ?> content = (Map<String, ?>) source.get(id);
             try (XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON)) {
                 builder.map(content);
-                result.add(new PutPipelineRequest(id, BytesReference.bytes(builder), XContentType.JSON));
+                result.add(
+                    new PutPipelineRequest(
+                        RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+                        RESERVED_CLUSTER_STATE_HANDLER_IGNORED_TIMEOUT,
+                        id,
+                        BytesReference.bytes(builder),
+                        XContentType.JSON
+                    )
+                );
             } catch (Exception e) {
                 throw new ElasticsearchGenerationException("Failed to generate [" + source + "]", e);
             }

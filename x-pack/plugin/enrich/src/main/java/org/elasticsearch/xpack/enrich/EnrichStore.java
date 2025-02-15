@@ -8,7 +8,6 @@ package org.elasticsearch.xpack.enrich;
 
 import org.elasticsearch.ResourceAlreadyExistsException;
 import org.elasticsearch.ResourceNotFoundException;
-import org.elasticsearch.Version;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateUpdateTask;
@@ -20,6 +19,7 @@ import org.elasticsearch.cluster.metadata.MetadataCreateIndexService;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.core.SuppressForbidden;
+import org.elasticsearch.xpack.core.enrich.EnrichMetadata;
 import org.elasticsearch.xpack.core.enrich.EnrichPolicy;
 
 import java.util.Arrays;
@@ -80,25 +80,17 @@ public final class EnrichStore {
             );
         }
 
-        final EnrichPolicy finalPolicy;
-        if (policy.getElasticsearchVersion() == null) {
-            finalPolicy = new EnrichPolicy(
-                policy.getType(),
-                policy.getQuery(),
-                policy.getIndices(),
-                policy.getMatchField(),
-                policy.getEnrichFields(),
-                Version.CURRENT
-            );
-        } else {
-            finalPolicy = policy;
-        }
         updateClusterState(clusterService, handler, current -> {
-            for (String indexExpression : finalPolicy.getIndices()) {
+            final Map<String, EnrichPolicy> originalPolicies = getPolicies(current);
+            if (originalPolicies.containsKey(name)) {
+                throw new ResourceAlreadyExistsException("policy [{}] already exists", name);
+            }
+            for (String indexExpression : policy.getIndices()) {
                 // indices field in policy can contain wildcards, aliases etc.
                 String[] concreteIndices = indexNameExpressionResolver.concreteIndexNames(
                     current,
                     IndicesOptions.strictExpandOpen(),
+                    true,
                     indexExpression
                 );
                 for (String concreteIndex : concreteIndices) {
@@ -109,16 +101,13 @@ public final class EnrichStore {
                         throw new IllegalArgumentException("source index [" + concreteIndex + "] has no mapping");
                     }
                     Map<String, Object> mappingSource = mapping.getSourceAsMap();
-                    EnrichPolicyRunner.validateMappings(name, finalPolicy, concreteIndex, mappingSource);
+                    EnrichPolicyRunner.validateMappings(name, policy, concreteIndex, mappingSource);
                 }
             }
 
-            final Map<String, EnrichPolicy> policies = getPolicies(current);
-            EnrichPolicy existing = policies.putIfAbsent(name, finalPolicy);
-            if (existing != null) {
-                throw new ResourceAlreadyExistsException("policy [{}] already exists", name);
-            }
-            return policies;
+            final Map<String, EnrichPolicy> updatedPolicies = new HashMap<>(originalPolicies);
+            updatedPolicies.put(name, policy);
+            return updatedPolicies;
         });
     }
 
@@ -137,13 +126,14 @@ public final class EnrichStore {
         }
 
         updateClusterState(clusterService, handler, current -> {
-            final Map<String, EnrichPolicy> policies = getPolicies(current);
-            if (policies.containsKey(name) == false) {
+            final Map<String, EnrichPolicy> originalPolicies = getPolicies(current);
+            if (originalPolicies.containsKey(name) == false) {
                 throw new ResourceNotFoundException("policy [{}] not found", name);
             }
 
-            policies.remove(name);
-            return policies;
+            final Map<String, EnrichPolicy> updatedPolicies = new HashMap<>(originalPolicies);
+            updatedPolicies.remove(name);
+            return updatedPolicies;
         });
     }
 
@@ -165,18 +155,11 @@ public final class EnrichStore {
      * Gets all policies in the cluster.
      *
      * @param state the cluster state
-     * @return a Map of <code>policyName, EnrichPolicy</code> of the policies
+     * @return a read-only Map of <code>policyName, EnrichPolicy</code> of the policies
      */
     public static Map<String, EnrichPolicy> getPolicies(ClusterState state) {
-        final Map<String, EnrichPolicy> policies;
-        final EnrichMetadata enrichMetadata = state.metadata().custom(EnrichMetadata.TYPE);
-        if (enrichMetadata != null) {
-            // Make a copy, because policies map inside custom metadata is read only:
-            policies = new HashMap<>(enrichMetadata.getPolicies());
-        } else {
-            policies = new HashMap<>();
-        }
-        return policies;
+        final EnrichMetadata metadata = state.metadata().custom(EnrichMetadata.TYPE, EnrichMetadata.EMPTY);
+        return metadata.getPolicies();
     }
 
     private static void updateClusterState(

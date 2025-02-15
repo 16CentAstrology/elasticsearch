@@ -1,9 +1,10 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License
- * 2.0 and the Server Side Public License, v 1; you may not use this file except
- * in compliance with, at your election, the Elastic License 2.0 or the Server
- * Side Public License, v 1.
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
 package org.elasticsearch.plugins;
@@ -17,7 +18,8 @@ import org.elasticsearch.core.Strings;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.env.TestEnvironment;
 import org.elasticsearch.index.IndexModule;
-import org.elasticsearch.plugin.analysis.api.CharFilterFactory;
+import org.elasticsearch.jdk.RuntimeVersionFeature;
+import org.elasticsearch.plugin.analysis.CharFilterFactory;
 import org.elasticsearch.plugins.scanners.PluginInfo;
 import org.elasticsearch.plugins.spi.BarPlugin;
 import org.elasticsearch.plugins.spi.BarTestService;
@@ -46,6 +48,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
@@ -63,7 +66,16 @@ public class PluginsServiceTests extends ESTestCase {
     public static class FilterablePlugin extends Plugin implements ScriptPlugin {}
 
     static PluginsService newPluginsService(Settings settings) {
-        return new PluginsService(settings, null, null, TestEnvironment.newEnvironment(settings).pluginsFile());
+        return new PluginsService(
+            settings,
+            null,
+            PluginsLoader.createPluginsLoader(
+                Set.of(),
+                PluginsLoader.loadPluginsBundles(TestEnvironment.newEnvironment(settings).pluginsDir()),
+                Map.of(),
+                false
+            )
+        );
     }
 
     static PluginsService newMockPluginsService(List<Class<? extends Plugin>> classpathPlugins) {
@@ -78,9 +90,8 @@ public class PluginsServiceTests extends ESTestCase {
     // This test uses a mock in order to use plugins from the classpath
     public void testFilterPlugins() {
         PluginsService service = newMockPluginsService(List.of(FakePlugin.class, FilterablePlugin.class));
-        List<ScriptPlugin> scriptPlugins = service.filterPlugins(ScriptPlugin.class);
-        assertEquals(1, scriptPlugins.size());
-        assertEquals(FilterablePlugin.class, scriptPlugins.get(0).getClass());
+        List<ScriptPlugin> scriptPlugins = service.filterPlugins(ScriptPlugin.class).toList();
+        assertThat(scriptPlugins, contains(instanceOf(FilterablePlugin.class)));
     }
 
     // This test uses a mock in order to use plugins from the classpath
@@ -454,11 +465,13 @@ public class PluginsServiceTests extends ESTestCase {
 
     public void testExtensiblePlugin() {
         TestExtensiblePlugin extensiblePlugin = new TestExtensiblePlugin();
+        var classname = "FakePlugin";
         PluginsService.loadExtensions(
             List.of(
                 new PluginsService.LoadedPlugin(
-                    new PluginDescriptor("extensible", null, null, null, null, null, null, List.of(), false, false, false, false),
-                    extensiblePlugin
+                    new PluginDescriptor("extensible", null, null, null, null, classname, null, List.of(), false, false, false, false),
+                    extensiblePlugin,
+                    null
                 )
             )
         );
@@ -471,12 +484,27 @@ public class PluginsServiceTests extends ESTestCase {
         PluginsService.loadExtensions(
             List.of(
                 new PluginsService.LoadedPlugin(
-                    new PluginDescriptor("extensible", null, null, null, null, null, null, List.of(), false, false, false, false),
-                    extensiblePlugin
+                    new PluginDescriptor("extensible", null, null, null, null, classname, null, List.of(), false, false, false, false),
+                    extensiblePlugin,
+                    null
                 ),
                 new PluginsService.LoadedPlugin(
-                    new PluginDescriptor("test", null, null, null, null, null, null, List.of("extensible"), false, false, false, false),
-                    testPlugin
+                    new PluginDescriptor(
+                        "test",
+                        null,
+                        null,
+                        null,
+                        null,
+                        classname,
+                        null,
+                        List.of("extensible"),
+                        false,
+                        false,
+                        false,
+                        false
+                    ),
+                    testPlugin,
+                    null
                 )
             )
         );
@@ -493,10 +521,9 @@ public class PluginsServiceTests extends ESTestCase {
         class TestExtension implements TestExtensionPoint {
             private TestExtension() {}
         }
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> { PluginsService.createExtension(TestExtension.class, TestExtensionPoint.class, plugin); }
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            PluginsService.createExtension(TestExtension.class, TestExtensionPoint.class, plugin);
+        });
 
         assertThat(
             e,
@@ -525,10 +552,9 @@ public class PluginsServiceTests extends ESTestCase {
 
             }
         }
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> { PluginsService.createExtension(TestExtension.class, TestExtensionPoint.class, plugin); }
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            PluginsService.createExtension(TestExtension.class, TestExtensionPoint.class, plugin);
+        });
 
         assertThat(
             e,
@@ -546,10 +572,9 @@ public class PluginsServiceTests extends ESTestCase {
 
     public void testBadSingleParameterConstructor() {
         TestPlugin plugin = new TestPlugin();
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> { PluginsService.createExtension(BadSingleParameterConstructorExtension.class, TestExtensionPoint.class, plugin); }
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            PluginsService.createExtension(BadSingleParameterConstructorExtension.class, TestExtensionPoint.class, plugin);
+        });
 
         assertThat(
             e,
@@ -571,10 +596,9 @@ public class PluginsServiceTests extends ESTestCase {
 
     public void testTooManyParametersExtensionConstructors() {
         TestPlugin plugin = new TestPlugin();
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> { PluginsService.createExtension(TooManyParametersConstructorExtension.class, TestExtensionPoint.class, plugin); }
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            PluginsService.createExtension(TooManyParametersConstructorExtension.class, TestExtensionPoint.class, plugin);
+        });
 
         assertThat(
             e,
@@ -594,10 +618,9 @@ public class PluginsServiceTests extends ESTestCase {
 
     public void testThrowingConstructor() {
         TestPlugin plugin = new TestPlugin();
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
-            () -> { PluginsService.createExtension(ThrowingConstructorExtension.class, TestExtensionPoint.class, plugin); }
-        );
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> {
+            PluginsService.createExtension(ThrowingConstructorExtension.class, TestExtensionPoint.class, plugin);
+        });
 
         assertThat(
             e,
@@ -704,10 +727,10 @@ public class PluginsServiceTests extends ESTestCase {
             .instance();
 
         // We shouldn't find the FooTestService implementation with PluginOther
-        assertThat(MockPluginsService.createExtensions(TestService.class, othPlugin), empty());
+        assertThat(MockPluginsService.createExtensions(TestService.class, othPlugin, e -> false), empty());
 
         // We should find the FooTestService implementation when we use FooPlugin, because it matches the constructor arg.
-        var providers = MockPluginsService.createExtensions(TestService.class, fooPlugin);
+        var providers = MockPluginsService.createExtensions(TestService.class, fooPlugin, e -> false);
 
         assertThat(providers, allOf(hasSize(1), everyItem(instanceOf(BarTestService.class))));
     }
@@ -748,12 +771,16 @@ public class PluginsServiceTests extends ESTestCase {
         Path jar = plugin.resolve("impl.jar");
         JarUtils.createJarWithEntries(jar, Map.of("p/DeprecatedPlugin.class", InMemoryJavaCompiler.compile("p.DeprecatedPlugin", """
             package p;
+            import org.elasticsearch.cluster.routing.allocation.allocator.ShardsAllocator;
+            import org.elasticsearch.common.settings.ClusterSettings;
+            import org.elasticsearch.common.settings.Settings;
+            import org.elasticsearch.plugins.ClusterPlugin;
+            import org.elasticsearch.plugins.Plugin;
             import java.util.Map;
-            import org.elasticsearch.plugins.*;
-            import org.elasticsearch.cluster.coordination.ElectionStrategy;
-            public class DeprecatedPlugin extends Plugin implements DiscoveryPlugin {
+            import java.util.function.Supplier;
+            public class DeprecatedPlugin extends Plugin implements ClusterPlugin {
                 @Override
-                public Map<String, ElectionStrategy> getElectionStrategies() {
+                public Map<String, Supplier<ShardsAllocator>> getShardsAllocators(Settings settings, ClusterSettings clusterSettings) {
                     return Map.of();
                 }
             }
@@ -761,10 +788,9 @@ public class PluginsServiceTests extends ESTestCase {
 
         var pluginService = newPluginsService(settings);
         try {
-            assertWarnings(
-                "Plugin class p.DeprecatedPlugin from plugin deprecated-plugin implements deprecated method "
-                    + "getElectionStrategies from plugin interface DiscoveryPlugin. This method will be removed in a future release."
-            );
+            assertCriticalWarnings("""
+                Plugin class p.DeprecatedPlugin from plugin deprecated-plugin implements deprecated method getShardsAllocators from \
+                plugin interface ClusterPlugin. This method will be removed in a future release.""");
         } finally {
             closePluginLoaders(pluginService);
         }
@@ -794,8 +820,8 @@ public class PluginsServiceTests extends ESTestCase {
         JarUtils.createJarWithEntries(jar, Map.of("p/A.class", InMemoryJavaCompiler.compile("p.A", """
             package p;
             import java.util.Map;
-            import org.elasticsearch.plugin.analysis.api.CharFilterFactory;
-            import org.elasticsearch.plugin.api.NamedComponent;
+            import org.elasticsearch.plugin.analysis.CharFilterFactory;
+            import org.elasticsearch.plugin.NamedComponent;
             import java.io.Reader;
             @NamedComponent( "a_name")
             public class A  implements CharFilterFactory {
@@ -808,7 +834,7 @@ public class PluginsServiceTests extends ESTestCase {
         Path namedComponentFile = plugin.resolve("named_components.json");
         Files.writeString(namedComponentFile, """
             {
-              "org.elasticsearch.plugin.analysis.api.CharFilterFactory": {
+              "org.elasticsearch.plugin.analysis.CharFilterFactory": {
                 "a_name": "p.A"
               }
             }
@@ -827,7 +853,7 @@ public class PluginsServiceTests extends ESTestCase {
 
             // check ubermodule classloader usage
             Collection<PluginInfo> stablePluginInfos = pluginService.getStablePluginRegistry()
-                .getPluginInfosForExtensible("org.elasticsearch.plugin.analysis.api.CharFilterFactory");
+                .getPluginInfosForExtensible("org.elasticsearch.plugin.analysis.CharFilterFactory");
             assertThat(stablePluginInfos, hasSize(1));
             ClassLoader stablePluginClassLoader = stablePluginInfos.stream().findFirst().orElseThrow().loader();
             assertThat(stablePluginClassLoader, instanceOf(UberModuleClassLoader.class));
@@ -848,26 +874,13 @@ public class PluginsServiceTests extends ESTestCase {
     }
 
     public void testCanCreateAClassLoader() {
+        assumeTrue("security manager must be available", RuntimeVersionFeature.isSecurityManagerAvailable());
         assertEquals(
             "access denied (\"java.lang.RuntimePermission\" \"createClassLoader\")",
             expectThrows(AccessControlException.class, () -> new Loader(this.getClass().getClassLoader())).getMessage()
         );
         var loader = PrivilegedOperations.supplierWithCreateClassLoader(() -> new Loader(this.getClass().getClassLoader()));
         assertEquals(this.getClass().getClassLoader(), loader.getParent());
-    }
-
-    public void testToModuleName() {
-        assertThat(PluginsService.toModuleName("module.name"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("module-name"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("module-name1"), equalTo("module.name1"));
-        assertThat(PluginsService.toModuleName("1module-name"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("module-name!"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("module!@#name!"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("!module-name!"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("module_name"), equalTo("module_name"));
-        assertThat(PluginsService.toModuleName("-module-name-"), equalTo("module.name"));
-        assertThat(PluginsService.toModuleName("_module_name"), equalTo("_module_name"));
-        assertThat(PluginsService.toModuleName("_"), equalTo("_"));
     }
 
     static final class Loader extends ClassLoader {
@@ -877,22 +890,25 @@ public class PluginsServiceTests extends ESTestCase {
     }
 
     // Closes the URLClassLoaders and UberModuleClassloaders of plugins loaded by the given plugin service.
+    // We can use the direct ClassLoader from the plugin because tests do not use any parent SPI ClassLoaders.
     static void closePluginLoaders(PluginsService pluginService) {
         for (var lp : pluginService.plugins()) {
-            if (lp.loader()instanceof URLClassLoader urlClassLoader) {
+            if (lp.classLoader() instanceof URLClassLoader urlClassLoader) {
                 try {
                     PrivilegedOperations.closeURLClassLoader(urlClassLoader);
                 } catch (IOException unexpected) {
                     throw new UncheckedIOException(unexpected);
                 }
-            }
-            if (lp.loader()instanceof UberModuleClassLoader loader) {
+            } else if (lp.classLoader() instanceof UberModuleClassLoader loader) {
                 try {
                     PrivilegedOperations.closeURLClassLoader(loader.getInternalLoader());
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
+            } else {
+                throw new AssertionError("Cannot close unexpected classloader " + lp.classLoader());
             }
+
         }
     }
 

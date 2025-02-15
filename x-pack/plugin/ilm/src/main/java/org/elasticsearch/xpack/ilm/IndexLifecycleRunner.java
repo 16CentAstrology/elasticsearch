@@ -11,13 +11,14 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateObserver;
-import org.elasticsearch.cluster.ClusterStateTaskConfig;
 import org.elasticsearch.cluster.ClusterStateTaskExecutor;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.LifecycleExecutionState;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.cluster.service.MasterServiceTaskQueue;
 import org.elasticsearch.common.Priority;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.core.TimeValue;
@@ -39,13 +40,12 @@ import org.elasticsearch.xpack.ilm.history.ILMHistoryStore;
 
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.LongSupplier;
 
 import static org.elasticsearch.core.Strings.format;
-import static org.elasticsearch.xpack.core.ilm.LifecycleSettings.LIFECYCLE_ORIGINATION_DATE;
+import static org.elasticsearch.index.IndexSettings.LIFECYCLE_ORIGINATION_DATE;
 
 class IndexLifecycleRunner {
     private static final Logger logger = LogManager.getLogger(IndexLifecycleRunner.class);
@@ -54,6 +54,7 @@ class IndexLifecycleRunner {
     private final PolicyStepsRegistry stepRegistry;
     private final ILMHistoryStore ilmHistoryStore;
     private final LongSupplier nowSupplier;
+    private final MasterServiceTaskQueue<IndexLifecycleClusterStateUpdateTask> masterServiceTaskQueue;
 
     @SuppressWarnings("Convert2Lambda") // can't SuppressForbidden on a lambda
     private static final ClusterStateTaskExecutor<IndexLifecycleClusterStateUpdateTask> ILM_TASK_EXECUTOR =
@@ -91,6 +92,7 @@ class IndexLifecycleRunner {
         this.clusterService = clusterService;
         this.nowSupplier = nowSupplier;
         this.threadPool = threadPool;
+        this.masterServiceTaskQueue = clusterService.createTaskQueue("ilm-runner", Priority.NORMAL, ILM_TASK_EXECUTOR);
     }
 
     /**
@@ -288,13 +290,7 @@ class IndexLifecycleRunner {
             // IndexLifecycleRunner#runPeriodicStep} run the policy will still be in the ERROR step, as we haven't been able
             // to move it back into the failed step, so we'll try again
             submitUnlessAlreadyQueued(
-                String.format(
-                    Locale.ROOT,
-                    "ilm-retry-failed-step {policy [%s], index [%s], failedStep [%s]}",
-                    policy,
-                    index,
-                    failedStep.getKey()
-                ),
+                Strings.format("ilm-retry-failed-step {policy [%s], index [%s], failedStep [%s]}", policy, index, failedStep.getKey()),
                 new MoveToRetryFailedStepUpdateTask(indexMetadata.getIndex(), policy, currentStep, failedStep)
             );
         } else {
@@ -442,7 +438,7 @@ class IndexLifecycleRunner {
         } else if (currentStep instanceof ClusterStateActionStep || currentStep instanceof ClusterStateWaitStep) {
             logger.debug("[{}] running policy with current-step [{}]", indexMetadata.getIndex().getName(), currentStep.getKey());
             submitUnlessAlreadyQueued(
-                String.format(Locale.ROOT, "ilm-execute-cluster-state-steps [%s]", currentStep),
+                Strings.format("ilm-execute-cluster-state-steps [%s]", currentStep),
                 new ExecuteStepsUpdateTask(policy, indexMetadata.getIndex(), currentStep, stepRegistry, this, nowSupplier)
             );
         } else {
@@ -457,8 +453,7 @@ class IndexLifecycleRunner {
     private void moveToStep(Index index, String policy, Step.StepKey currentStepKey, Step.StepKey newStepKey) {
         logger.debug("[{}] moving to step [{}] {} -> {}", index.getName(), policy, currentStepKey, newStepKey);
         submitUnlessAlreadyQueued(
-            String.format(
-                Locale.ROOT,
+            Strings.format(
                 "ilm-move-to-step {policy [%s], index [%s], currentStep [%s], nextStep [%s]}",
                 policy,
                 index.getName(),
@@ -484,13 +479,7 @@ class IndexLifecycleRunner {
             e
         );
         submitUnlessAlreadyQueued(
-            String.format(
-                Locale.ROOT,
-                "ilm-move-to-error-step {policy [%s], index [%s], currentStep [%s]}",
-                policy,
-                index.getName(),
-                currentStepKey
-            ),
+            Strings.format("ilm-move-to-error-step {policy [%s], index [%s], currentStep [%s]}", policy, index.getName(), currentStepKey),
             new MoveToErrorStepUpdateTask(index, policy, currentStepKey, e, nowSupplier, stepRegistry::getStep, clusterState -> {
                 IndexMetadata indexMetadata = clusterState.metadata().index(index);
                 registerFailedOperation(indexMetadata, e);
@@ -504,13 +493,7 @@ class IndexLifecycleRunner {
      */
     private void setStepInfo(Index index, String policy, @Nullable Step.StepKey currentStepKey, ToXContentObject stepInfo) {
         submitUnlessAlreadyQueued(
-            String.format(
-                Locale.ROOT,
-                "ilm-set-step-info {policy [%s], index [%s], currentStep [%s]}",
-                policy,
-                index.getName(),
-                currentStepKey
-            ),
+            Strings.format("ilm-set-step-info {policy [%s], index [%s], currentStep [%s]}", policy, index.getName(), currentStepKey),
             new SetStepInfoUpdateTask(index, policy, currentStepKey, stepInfo)
         );
     }
@@ -619,8 +602,6 @@ class IndexLifecycleRunner {
      */
     private final Set<Tuple<Index, StepKey>> busyIndices = Collections.synchronizedSet(new HashSet<>());
 
-    static final ClusterStateTaskConfig ILM_TASK_CONFIG = ClusterStateTaskConfig.build(Priority.NORMAL);
-
     /**
      * Tracks already executing {@link IndexLifecycleClusterStateUpdateTask} tasks in {@link #executingTasks} to prevent queueing up
      * duplicate cluster state updates.
@@ -635,12 +616,12 @@ class IndexLifecycleRunner {
             final Tuple<Index, StepKey> dedupKey = Tuple.tuple(task.index, task.currentStepKey);
             // index+step-key combination on a best-effort basis to skip checking for more work for an index on CS application
             busyIndices.add(dedupKey);
-            task.addListener(ActionListener.wrap(() -> {
+            task.addListener(ActionListener.running(() -> {
                 final boolean removed = executingTasks.remove(task);
                 busyIndices.remove(dedupKey);
                 assert removed : "tried to unregister unknown task [" + task + "]";
             }));
-            clusterService.submitStateUpdateTask(source, task, ILM_TASK_CONFIG, ILM_TASK_EXECUTOR);
+            masterServiceTaskQueue.submitTask(source, task, null);
         } else {
             logger.trace("skipped redundant execution of [{}]", source);
         }

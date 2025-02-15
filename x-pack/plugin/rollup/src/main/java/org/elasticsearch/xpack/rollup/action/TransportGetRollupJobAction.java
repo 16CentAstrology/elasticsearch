@@ -16,11 +16,15 @@ import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.logging.DeprecationCategory;
+import org.elasticsearch.common.logging.DeprecationLogger;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.discovery.MasterNotDiscoveredException;
+import org.elasticsearch.injection.guice.Inject;
 import org.elasticsearch.persistent.PersistentTasksCustomMetadata;
+import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
-import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportResponseHandler;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.rollup.RollupField;
 import org.elasticsearch.xpack.core.rollup.action.GetRollupJobsAction;
@@ -32,11 +36,16 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static org.elasticsearch.xpack.rollup.Rollup.DEPRECATION_KEY;
+import static org.elasticsearch.xpack.rollup.Rollup.DEPRECATION_MESSAGE;
+
 public class TransportGetRollupJobAction extends TransportTasksAction<
     RollupJobTask,
     GetRollupJobsAction.Request,
     GetRollupJobsAction.Response,
     GetRollupJobsAction.Response> {
+
+    private static final DeprecationLogger DEPRECATION_LOGGER = DeprecationLogger.getLogger(TransportGetRollupCapsAction.class);
 
     @Inject
     public TransportGetRollupJobAction(TransportService transportService, ActionFilters actionFilters, ClusterService clusterService) {
@@ -47,13 +56,13 @@ public class TransportGetRollupJobAction extends TransportTasksAction<
             actionFilters,
             GetRollupJobsAction.Request::new,
             GetRollupJobsAction.Response::new,
-            GetRollupJobsAction.Response::new,
-            ThreadPool.Names.SAME
+            EsExecutors.DIRECT_EXECUTOR_SERVICE
         );
     }
 
     @Override
     protected void doExecute(Task task, GetRollupJobsAction.Request request, ActionListener<GetRollupJobsAction.Response> listener) {
+        DEPRECATION_LOGGER.warn(DeprecationCategory.API, DEPRECATION_KEY, DEPRECATION_MESSAGE);
         final ClusterState state = clusterService.state();
         final DiscoveryNodes nodes = state.nodes();
 
@@ -77,7 +86,11 @@ public class TransportGetRollupJobAction extends TransportTasksAction<
                     nodes.getMasterNode(),
                     actionName,
                     request,
-                    new ActionListenerResponseHandler<>(listener, GetRollupJobsAction.Response::new)
+                    new ActionListenerResponseHandler<>(
+                        listener,
+                        GetRollupJobsAction.Response::new,
+                        TransportResponseHandler.TRANSPORT_WORKER
+                    )
                 );
             }
         }
@@ -108,7 +121,7 @@ public class TransportGetRollupJobAction extends TransportTasksAction<
 
     @Override
     protected void taskOperation(
-        Task actionTask,
+        CancellableTask actionTask,
         GetRollupJobsAction.Request request,
         RollupJobTask jobTask,
         ActionListener<GetRollupJobsAction.Response> listener
